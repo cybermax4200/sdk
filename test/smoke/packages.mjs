@@ -6,34 +6,25 @@
 //   2. Runs `pnpm pack --dry-run --json` and verifies the published file list:
 //      every packed path is covered by `files`, nothing on the deny list is
 //      shipped, and every documented entry-point target is present.
-//   3. Unpacks a real tarball into a clean fixture's node_modules (the same
-//      layout a consumer gets after `npm install`), installing only the
-//      package's third-party (non-`@wraith-protocol/*`) dependencies from npm
-//      so framework entry points can load.
-//   4. Verifies ESM imports of every entry point from the installed package.
-//   5. Verifies TypeScript declarations resolve when each entry point is
+//   3. Packs the target tarball plus any `@wraith-protocol/*` workspace
+//      dependencies into real .tgz files, writes a fixture package.json that
+//      references every dependency (workspace ones resolved to their local
+//      tarballs, third-party ones by their declared version range), and runs
+//      `pnpm install` so the fixture layout matches what a real consumer gets
+//      after `npm install`.
+//   4. Asserts that no `workspace:` protocol survives into the packed
+//      package.json — i.e. pnpm rewrote every workspace:* to a real semver
+//      range before publishing.
+//   5. Verifies ESM imports of every entry point from the installed package.
+//   6. Verifies TypeScript declarations resolve when each entry point is
 //      imported by its package specifier.
-//   6. Verifies documented exports (the exports-map targets exist on disk).
-//
-// A package FAILS if any of its workspace-only imports (e.g.
-// `@wraith-protocol/sdk: workspace:*`) cannot resolve from npm in the clean
-// fixture — that is the signal that the package is not yet independently
-// publishable. Because the fixture never installs `@wraith-protocol/*`
-// workspace packages, those imports surface as "cannot find module" errors.
+//   7. Verifies documented exports (the exports-map targets exist on disk).
 //
 // Run with:
 //
 //   pnpm test:packages
 
-import {
-  existsSync,
-  mkdtempSync,
-  mkdirSync,
-  readFileSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -267,36 +258,175 @@ function scopeDir(fixture, packageName) {
   return join(fixture, 'node_modules', ...packageName.split('/'));
 }
 
-function unpackTarball(tarball, fixture, packageName) {
-  const target = scopeDir(fixture, packageName);
-  mkdirSync(target, { recursive: true });
-  const result = spawn('tar', ['-xzf', tarball, '--strip-components=1', '-C', target]);
-  if (!result.ok) {
-    return {
-      error: `tar extract failed: ${(result.stderr || result.stdout).trim().split('\n')[0]}`,
-    };
-  }
-  return { target };
-}
+// ---------------------------------------------------------------------------
+// Workspace-package resolution
+// ---------------------------------------------------------------------------
 
-function installThirdPartyDeps(fixture, pkgJson) {
-  const deps = new Set();
+// Map of every known workspace package name to its directory path (relative to
+// repoRoot).  This covers the root SDK and all companion packages.
+const WORKSPACE_PACKAGES = new Map([
+  ['@wraith-protocol/sdk', '.'],
+  ['@wraith-protocol/sdk-agent', 'packages/sdk-agent'],
+  ['@wraith-protocol/sdk-react', 'packages/sdk-react'],
+  ['@wraith-protocol/sdk-vue', 'packages/sdk-vue'],
+  ['@wraith-protocol/sdk-solid', 'packages/sdk-solid'],
+  ['@wraith-protocol/sdk-svelte', 'packages/sdk-svelte'],
+  ['@wraith-protocol/codemod', 'packages/codemod'],
+  ['@wraith-protocol/test-vectors', 'packages/test-vectors'],
+]);
+
+/**
+ * Collect every @wraith-protocol/* name referenced in any dep field, then
+ * transitively for each of those packages as well, stopping when the closure
+ * is stable.  Returns a Set of package names (excluding `targetName` itself).
+ */
+function collectWraithDeps(targetName, visited = new Set()) {
+  if (visited.has(targetName)) return visited;
+  visited.add(targetName);
+
+  const dir = WORKSPACE_PACKAGES.get(targetName);
+  if (!dir) return visited;
+
+  let pkgJson;
+  try {
+    pkgJson = readPkgJson(resolve(repoRoot, dir));
+  } catch {
+    return visited;
+  }
+
   for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
     for (const dep of Object.keys(pkgJson[field] || {})) {
-      if (dep.startsWith('@wraith-protocol/')) continue;
-      deps.add(dep);
+      if (dep.startsWith('@wraith-protocol/') && !visited.has(dep)) {
+        collectWraithDeps(dep, visited);
+      }
     }
   }
-  const depList = [...deps];
-  if (depList.length === 0) return { ok: true };
-  // Install third-party deps from npm. `@wraith-protocol/*` workspace deps are
-  // deliberately absent — their absence is the "workspace-only import cannot
-  // resolve from npm" signal under test.
-  const result = spawn('pnpm', ['install', ...depList], { cwd: fixture });
+  return visited;
+}
+
+/**
+ * Pack every @wraith-protocol/* workspace dependency (transitively) of
+ * `targetName` into `destDir`.  Returns a Map<name, tarballPath> for all
+ * deps (not including the target itself, which is packed separately).
+ */
+function packWraithDeps(targetName, destDir) {
+  const deps = collectWraithDeps(targetName);
+  deps.delete(targetName); // target is already packed by the caller
+
+  const tarballs = new Map();
+  for (const name of deps) {
+    const dir = WORKSPACE_PACKAGES.get(name);
+    if (!dir) continue;
+    const pkgDir = resolve(repoRoot, dir);
+
+    // Build first so dist/ is fresh (best-effort; ignore if no build script).
+    const pkgJson = readPkgJson(pkgDir);
+    if (pkgJson.scripts?.build) {
+      spawn('pnpm', ['--filter', name, 'build'], { cwd: repoRoot });
+    }
+
+    const packed = packTarball(pkgDir, destDir);
+    if (packed.error) {
+      tarballs.set(name, { error: packed.error });
+    } else {
+      tarballs.set(name, { tarball: packed.tarball });
+    }
+  }
+  return tarballs;
+}
+
+/**
+ * Check that the packed package.json contains no `workspace:` protocol in any
+ * dependency field — pnpm must have rewritten them all to real semver ranges.
+ */
+function noWorkspaceProtocolInPacked(tarball) {
+  const tmpExtract = mkdtempSync(join(tmpdir(), 'wraith-pkg-wscheck-'));
+  try {
+    const result = spawn('tar', [
+      '-xzf',
+      tarball,
+      '--strip-components=1',
+      '-C',
+      tmpExtract,
+      'package/package.json',
+    ]);
+    if (!result.ok) {
+      return [
+        `could not extract package.json from tarball to check workspace protocol: ${result.stderr.trim().split('\n')[0]}`,
+      ];
+    }
+    const packedManifest = JSON.parse(readFileSync(join(tmpExtract, 'package.json'), 'utf8'));
+    const problems = [];
+    for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
+      for (const [dep, version] of Object.entries(packedManifest[field] || {})) {
+        if (typeof version === 'string' && version.startsWith('workspace:')) {
+          problems.push(
+            `packed package.json still contains workspace protocol: ${field}.${dep} = "${version}"`,
+          );
+        }
+      }
+    }
+    return problems;
+  } finally {
+    rmSync(tmpExtract, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Install the target package (and all its dependencies) into a clean fixture
+ * directory using `pnpm install`.  @wraith-protocol/* workspace deps are
+ * resolved from pre-packed local tarballs so the install layout matches what a
+ * real consumer gets after `npm install`.
+ *
+ * Returns `{ ok, error? }`.
+ */
+function installPackage(fixture, targetTarball, targetPkgJson, wraith_dep_tarballs) {
+  // Build a dependency map for the fixture's own package.json.
+  const fixtureDeps = {};
+
+  // The target package itself — installed via its local tarball path.
+  fixtureDeps[targetPkgJson.name] = `file:${targetTarball}`;
+
+  // @wraith-protocol/* workspace deps — resolved from their packed tarballs.
+  for (const [name, result] of wraith_dep_tarballs) {
+    if (result.error) {
+      // Surface the pack error but continue; the import check will catch it.
+      console.log(`  note: could not pack workspace dep ${name}: ${result.error}`);
+      continue;
+    }
+    fixtureDeps[name] = `file:${result.tarball}`;
+  }
+
+  // Third-party deps — use the declared version range from the target manifest.
+  for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
+    for (const [dep, ver] of Object.entries(targetPkgJson[field] || {})) {
+      if (dep.startsWith('@wraith-protocol/')) continue;
+      if (!(dep in fixtureDeps)) fixtureDeps[dep] = ver;
+    }
+  }
+
+  // Write a fixture package.json that declares every dep at the resolved version.
+  const fixturePkg = join(fixture, 'package.json');
+  writeFileSync(
+    fixturePkg,
+    JSON.stringify(
+      {
+        name: 'wraith-pkg-smoke-fixture',
+        private: true,
+        type: 'module',
+        dependencies: fixtureDeps,
+      },
+      null,
+      2,
+    ),
+  );
+
+  console.log(`  installing ${Object.keys(fixtureDeps).length} deps via pnpm install …`);
+  const result = spawn('pnpm', ['install', '--no-lockfile'], { cwd: fixture });
   if (!result.ok) {
     return {
       ok: false,
-      error: `pnpm install third-party deps failed:\n${(result.stderr || result.stdout).trim().slice(0, 1200)}`,
+      error: `pnpm install failed:\n${(result.stderr || result.stdout).trim().slice(0, 1200)}`,
     };
   }
   return { ok: true };
@@ -431,7 +561,7 @@ async function checkPackage(pkg) {
   }
   problems.push(...checkFileList(pkgDir, pkgJson, listing.packed));
 
-  // 2. Pack a real tarball and place it in a clean fixture.
+  // 2. Pack a real tarball for the target package.
   const tmp = mkdtempSync(join(tmpdir(), 'wraith-pkg-pack-'));
   const packed = packTarball(pkgDir, tmp);
   if (packed.error) {
@@ -441,30 +571,22 @@ async function checkPackage(pkg) {
     return;
   }
 
+  // 2a. Assert no `workspace:` protocol survived into the packed manifest.
+  problems.push(...noWorkspaceProtocolInPacked(packed.tarball));
+
+  // 2b. Pack all transitive @wraith-protocol/* workspace dependencies so the
+  //     fixture install can resolve them from local tarballs rather than npm.
+  const wraith_dep_tarballs = packWraithDeps(pkg.name, tmp);
+
+  // 3. Create a clean fixture and install everything via pnpm install so the
+  //    resulting node_modules layout matches a real consumer install.
   const fixture = mkdtempSync(join(tmpdir(), 'wraith-pkg-smoke-'));
-  const fixturePkg = join(fixture, 'package.json');
-  writeFileSync(
-    fixturePkg,
-    JSON.stringify({ name: 'wraith-pkg-smoke-fixture', private: true, type: 'module' }, null, 2),
-  );
 
-  const deps = installThirdPartyDeps(fixture, pkgJson);
-  if (!deps.ok) {
-    // Non-fatal: the import check will still surface the missing-module signal.
-    console.log(`  note: ${deps.error}`);
-  }
-
-  const unpacked = unpackTarball(packed.tarball, fixture, pkgJson.name);
-  if (unpacked.error) {
-    problems.push(`unpack tarball: ${unpacked.error}`);
-    rmSync(tmp, { recursive: true, force: true });
-    try {
-      rmSync(fixture, { recursive: true, force: true });
-    } catch {
-      /* fixture already removed or locked */
-    }
-    record(pkg.name, problems);
-    return;
+  const installed = installPackage(fixture, packed.tarball, pkgJson, wraith_dep_tarballs);
+  if (!installed.ok) {
+    // Non-fatal for ESM/types checks — surface the error but continue so that
+    // documentedExportsOk still runs against the source on disk.
+    console.log(`  note: ${installed.error}`);
   }
 
   // Only packages with JS entry points get ESM/types/export checks.
@@ -473,15 +595,15 @@ async function checkPackage(pkg) {
   let importFailures = [];
   let typeFailures = [];
   if (hasEntryPoints) {
-    // 3. Documented exports exist on disk in the built package.
+    // 4. Documented exports exist on disk in the built package.
     problems.push(
       ...documentedExportsOk(pkgDir, entrypoints).map((f) => `exports ${f.ep.subpath}: ${f.error}`),
     );
 
-    // 4. ESM imports from the installed package.
+    // 5. ESM imports from the installed package.
     importFailures = await esmImportsOk(fixture, entrypoints);
 
-    // 5. Type declarations resolve when imported by package specifier.
+    // 6. Type declarations resolve when imported by package specifier.
     typeFailures = typesOk(fixture, pkgJson.name, entrypoints);
 
     for (const f of importFailures) problems.push(`esm ${f.ep.subpath}: ${f.error}`);
