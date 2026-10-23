@@ -200,20 +200,22 @@ function dryRunPack(pkgDir) {
   return { packed: parsed.files };
 }
 
+function tarballNameFor(pkgJson) {
+  const scoped = pkgJson.name.replace(/^@/, '').replace(/\//g, '-');
+  return `${scoped}-${pkgJson.version}.tgz`;
+}
+
 function packTarball(pkgDir, dest) {
   const result = spawn('pnpm', ['pack', '--pack-destination', dest], { cwd: pkgDir });
   if (!result.ok) {
     return { error: `pnpm pack failed: ${(result.stderr || result.stdout).trim().split('\n')[0]}` };
   }
-  let tarball;
-  try {
-    for (const entry of require('fs').readdirSync(dest)) {
-      if (entry.endsWith('.tgz')) tarball = join(dest, entry);
-    }
-  } catch {
-    /* no tarball */
+  const pkgJson = readPkgJson(pkgDir);
+  const expectedName = tarballNameFor(pkgJson);
+  const tarball = join(dest, expectedName);
+  if (!existsSync(tarball)) {
+    return { error: `could not locate packed tarball in ${dest} (expected ${expectedName})` };
   }
-  if (!tarball) return { error: `could not locate packed tarball in ${dest}` };
   return { tarball };
 }
 
@@ -304,6 +306,9 @@ function collectWraithDeps(targetName, visited = new Set()) {
   return visited;
 }
 
+// Pack cache so dependencies (especially the root SDK) are only built and packed once.
+const packedDepCache = new Map();
+
 /**
  * Pack every @wraith-protocol/* workspace dependency (transitively) of
  * `targetName` into `destDir`.  Returns a Map<name, tarballPath> for all
@@ -315,6 +320,11 @@ function packWraithDeps(targetName, destDir) {
 
   const tarballs = new Map();
   for (const name of deps) {
+    if (packedDepCache.has(name)) {
+      tarballs.set(name, packedDepCache.get(name));
+      continue;
+    }
+
     const dir = WORKSPACE_PACKAGES.get(name);
     if (!dir) continue;
     const pkgDir = resolve(repoRoot, dir);
@@ -330,6 +340,7 @@ function packWraithDeps(targetName, destDir) {
       tarballs.set(name, { error: packed.error });
     } else {
       tarballs.set(name, { tarball: packed.tarball });
+      packedDepCache.set(name, { tarball: packed.tarball });
     }
   }
   return tarballs;
@@ -383,6 +394,7 @@ function noWorkspaceProtocolInPacked(tarball) {
 function installPackage(fixture, targetTarball, targetPkgJson, wraith_dep_tarballs) {
   // Build a dependency map for the fixture's own package.json.
   const fixtureDeps = {};
+  const overrides = {};
 
   // The target package itself — installed via its local tarball path.
   fixtureDeps[targetPkgJson.name] = `file:${targetTarball}`;
@@ -395,13 +407,28 @@ function installPackage(fixture, targetTarball, targetPkgJson, wraith_dep_tarbal
       continue;
     }
     fixtureDeps[name] = `file:${result.tarball}`;
+    overrides[name] = `file:${result.tarball}`;
   }
 
-  // Third-party deps — use the declared version range from the target manifest.
-  for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
-    for (const [dep, ver] of Object.entries(targetPkgJson[field] || {})) {
-      if (dep.startsWith('@wraith-protocol/')) continue;
-      if (!(dep in fixtureDeps)) fixtureDeps[dep] = ver;
+  // Third-party deps — collect declared version ranges from the target manifest
+  // as well as all workspace dependencies (so transitive peer deps like
+  // @stellar/stellar-sdk on @wraith-protocol/sdk are installed in the fixture).
+  const manifests = [targetPkgJson];
+  for (const [name] of wraith_dep_tarballs) {
+    const dir = WORKSPACE_PACKAGES.get(name);
+    if (dir) {
+      try {
+        manifests.push(readPkgJson(resolve(repoRoot, dir)));
+      } catch {}
+    }
+  }
+
+  for (const manifest of manifests) {
+    for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
+      for (const [dep, ver] of Object.entries(manifest[field] || {})) {
+        if (dep.startsWith('@wraith-protocol/')) continue;
+        if (!(dep in fixtureDeps)) fixtureDeps[dep] = ver;
+      }
     }
   }
 
@@ -415,14 +442,23 @@ function installPackage(fixture, targetTarball, targetPkgJson, wraith_dep_tarbal
         private: true,
         type: 'module',
         dependencies: fixtureDeps,
+        overrides,
+        resolutions: overrides,
+        pnpm: { overrides },
       },
       null,
       2,
     ),
   );
 
+  let wsYaml = 'overrides:\n';
+  for (const [k, v] of Object.entries(overrides)) {
+    wsYaml += `  "${k}": "${v}"\n`;
+  }
+  writeFileSync(join(fixture, 'pnpm-workspace.yaml'), wsYaml);
+
   console.log(`  installing ${Object.keys(fixtureDeps).length} deps via pnpm install …`);
-  const result = spawn('pnpm', ['install', '--no-lockfile'], { cwd: fixture });
+  const result = spawn('pnpm', ['install', '--prefer-offline', '--no-lockfile'], { cwd: fixture });
   if (!result.ok) {
     return {
       ok: false,
@@ -462,47 +498,33 @@ async function esmImportsOk(fixture, entrypoints) {
 
 function typesOk(fixture, packageName, entrypoints) {
   const failures = [];
-  const tmp = mkdtempSync(join(tmpdir(), 'wraith-pkg-types-'));
-  try {
-    const toPosix = (p) => p.split(sep).join('/');
-    const importLines = entrypoints.map((ep, i) => `import * as ns${i} from '${ep.specifier}';`);
-    const useLine = `export const used = [${entrypoints.map((_, i) => `ns${i}`).join(', ')}];`;
-    writeFileSync(join(tmp, 'consume.ts'), `${importLines.join('\n')}\n${useLine}\n`);
-    const paths = {};
-    const root = scopeDir(fixture, packageName);
-    for (const ep of entrypoints) {
-      const rel = ep.typesRel;
-      if (rel && existsSync(resolve(root, rel)))
-        paths[ep.specifier] = [toPosix(resolve(root, rel))];
-    }
-    const tsconfig = {
-      compilerOptions: {
-        module: 'esnext',
-        moduleResolution: 'bundler',
-        target: 'es2020',
-        lib: ['es2020', 'dom'],
-        noEmit: true,
-        strict: false,
-        skipLibCheck: true,
-        types: [],
-        baseUrl: toPosix(fixture),
-        paths,
-      },
-      include: [toPosix(join(tmp, 'consume.ts'))],
-    };
-    writeFileSync(join(tmp, 'tsconfig.json'), JSON.stringify(tsconfig, null, 2));
-    const result = spawn('pnpm', ['exec', 'tsc', '-p', join(tmp, 'tsconfig.json')], {
-      cwd: repoRoot,
-    });
-    if (!result.ok) {
-      const text = (result.stderr || result.stdout).trim();
-      for (const ep of entrypoints) failures.push({ ep, error: text.split('\n')[0] });
-      console.log(`    types: tsc reported errors:\n${text.slice(0, 1200)}`);
-    } else {
-      for (const ep of entrypoints) console.log(`    ok   types ${ep.subpath}`);
-    }
-  } finally {
-    rmSync(tmp, { recursive: true, force: true });
+  const importLines = entrypoints.map((ep, i) => `import * as ns${i} from '${ep.specifier}';`);
+  const useLine = `export const used = [${entrypoints.map((_, i) => `ns${i}`).join(', ')}];`;
+  writeFileSync(join(fixture, 'consume-types.ts'), `${importLines.join('\n')}\n${useLine}\n`);
+
+  const tsconfig = {
+    compilerOptions: {
+      module: 'esnext',
+      moduleResolution: 'bundler',
+      target: 'es2020',
+      lib: ['es2020', 'dom'],
+      noEmit: true,
+      strict: false,
+      skipLibCheck: true,
+    },
+    include: ['consume-types.ts'],
+  };
+  writeFileSync(join(fixture, 'tsconfig.json'), JSON.stringify(tsconfig, null, 2));
+
+  const result = spawn('pnpm', ['exec', 'tsc', '-p', join(fixture, 'tsconfig.json')], {
+    cwd: repoRoot,
+  });
+  if (!result.ok) {
+    const text = (result.stderr || result.stdout).trim();
+    for (const ep of entrypoints) failures.push({ ep, error: text.split('\n')[0] });
+    console.log(`    types: tsc reported errors:\n${text.slice(0, 1200)}`);
+  } else {
+    for (const ep of entrypoints) console.log(`    ok   types ${ep.subpath}`);
   }
   return failures;
 }
@@ -535,7 +557,7 @@ function record(name, problems) {
   );
 }
 
-async function checkPackage(pkg) {
+async function checkPackage(pkg, sharedPackDir) {
   const pkgDir = resolve(repoRoot, pkg.dir);
   const pkgJson = readPkgJson(pkgDir);
   console.log(`\n=== ${pkg.name} ===`);
@@ -562,11 +584,9 @@ async function checkPackage(pkg) {
   problems.push(...checkFileList(pkgDir, pkgJson, listing.packed));
 
   // 2. Pack a real tarball for the target package.
-  const tmp = mkdtempSync(join(tmpdir(), 'wraith-pkg-pack-'));
-  const packed = packTarball(pkgDir, tmp);
+  const packed = packTarball(pkgDir, sharedPackDir);
   if (packed.error) {
     problems.push(`pack: ${packed.error}`);
-    rmSync(tmp, { recursive: true, force: true });
     record(pkg.name, problems);
     return;
   }
@@ -576,7 +596,7 @@ async function checkPackage(pkg) {
 
   // 2b. Pack all transitive @wraith-protocol/* workspace dependencies so the
   //     fixture install can resolve them from local tarballs rather than npm.
-  const wraith_dep_tarballs = packWraithDeps(pkg.name, tmp);
+  const wraith_dep_tarballs = packWraithDeps(pkg.name, sharedPackDir);
 
   // 3. Create a clean fixture and install everything via pnpm install so the
   //    resulting node_modules layout matches a real consumer install.
@@ -584,9 +604,14 @@ async function checkPackage(pkg) {
 
   const installed = installPackage(fixture, packed.tarball, pkgJson, wraith_dep_tarballs);
   if (!installed.ok) {
-    // Non-fatal for ESM/types checks — surface the error but continue so that
-    // documentedExportsOk still runs against the source on disk.
-    console.log(`  note: ${installed.error}`);
+    problems.push(`fixture install: ${installed.error}`);
+    try {
+      rmSync(fixture, { recursive: true, force: true });
+    } catch {
+      /* fixture already removed or locked */
+    }
+    record(pkg.name, problems);
+    return;
   }
 
   // Only packages with JS entry points get ESM/types/export checks.
@@ -612,7 +637,6 @@ async function checkPackage(pkg) {
     console.log(`  no JS entry points (data-only package); skipping ESM/types/exports checks`);
   }
 
-  rmSync(tmp, { recursive: true, force: true });
   try {
     rmSync(fixture, { recursive: true, force: true });
   } catch {
@@ -623,13 +647,18 @@ async function checkPackage(pkg) {
 }
 
 async function main() {
-  for (const pkg of PACKAGES) {
-    if (!existsSync(resolve(repoRoot, pkg.dir, 'package.json'))) {
-      console.error(`FAIL: package directory missing: ${pkg.dir}`);
-      failed += 1;
-      continue;
+  const sharedPackDir = mkdtempSync(join(tmpdir(), 'wraith-workspace-packs-'));
+  try {
+    for (const pkg of PACKAGES) {
+      if (!existsSync(resolve(repoRoot, pkg.dir, 'package.json'))) {
+        console.error(`FAIL: package directory missing: ${pkg.dir}`);
+        failed += 1;
+        continue;
+      }
+      await checkPackage(pkg, sharedPackDir);
     }
-    await checkPackage(pkg);
+  } finally {
+    rmSync(sharedPackDir, { recursive: true, force: true });
   }
 
   console.log(`\nCompanion package smoke tests: ${results.length} packages, ${failed} failed`);
