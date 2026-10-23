@@ -5,10 +5,11 @@ import {
   deriveStealthKeys,
   deriveStealthKeysFromSigner,
   buildStealthPayment,
-  getDeployment,
+  resolveStellarName,
   type StealthKeys,
   type StellarStealthSigner,
   type BuildStealthPaymentOptions,
+  type ResolveStellarNameOptions,
 } from '@wraith-protocol/sdk/chains/stellar';
 import { Horizon } from '@stellar/stellar-sdk';
 import { getUnknownErrorMessage } from '@wraith-protocol/sdk';
@@ -93,25 +94,63 @@ export function useStellarBalance(publicKey: string, rpcUrl = 'https://horizon.s
   return { balance, loading };
 }
 
+export function useStellarName(
+  name: string | undefined,
+  chain?: string,
+  options?: ResolveStellarNameOptions,
+): { address: string | null; loading: boolean; error: Error | null };
 /** Hook to resolve a Wraith name on Stellar */
 export function useStellarName(name: string | undefined, chain = 'stellar') {
   const [address, setAddress] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  // eslint-disable-next-line prefer-rest-params
+  const options = arguments[2] as ResolveStellarNameOptions | undefined;
+  const rpcUrl = options?.rpcUrl;
+  const contractId = options?.contractId;
+  const networkPassphrase = options?.networkPassphrase;
+  const bypassCache = options?.bypassCache;
+  const ttlMs = options?.ttlMs;
+  const throwOnNotFound = options?.throwOnNotFound;
+  const callerSignal = options?.signal;
 
   useEffect(() => {
-    if (!name) return;
+    if (name === undefined) {
+      setAddress(null);
+      setLoading(false);
+      setError(null);
+      return;
+    }
     let mounted = true;
+    const controller = new AbortController();
+    const onCallerAbort = () => controller.abort(callerSignal?.reason);
+
+    if (callerSignal) {
+      if (callerSignal.aborted) {
+        controller.abort(callerSignal.reason);
+      } else {
+        callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+      }
+    }
 
     async function resolve() {
       setLoading(true);
       setError(null);
+      setAddress(null);
       try {
-        const deployment = getDeployment(chain);
-        // Stub for resolving name using the names contract.
-        // Integrators will fill in with actual logic if they need it,
-        // or this can be updated once the resolve logic is added to the SDK.
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        const resolved = await resolveStellarName(name!, chain, {
+          rpcUrl,
+          contractId,
+          networkPassphrase,
+          bypassCache,
+          ttlMs,
+          throwOnNotFound,
+          signal: controller.signal,
+        });
+        if (mounted && resolved !== null) {
+          setAddress(resolved);
+          return;
+        }
         if (!mounted) return;
         setAddress(null); // Return null or resolved meta-address
       } catch (err) {
@@ -126,8 +165,20 @@ export function useStellarName(name: string | undefined, chain = 'stellar') {
     resolve();
     return () => {
       mounted = false;
+      callerSignal?.removeEventListener('abort', onCallerAbort);
+      controller.abort();
     };
-  }, [name, chain]);
+  }, [
+    name,
+    chain,
+    rpcUrl,
+    contractId,
+    networkPassphrase,
+    bypassCache,
+    ttlMs,
+    throwOnNotFound,
+    callerSignal,
+  ]);
 
   return { address, loading, error };
 }

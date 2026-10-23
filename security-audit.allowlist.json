@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "updated": "2026-10-19",
+  "notes": "Critical advisories that are known and intentionally not blocking this release. Every entry has a remediation path and is tracked for a follow-up. Any critical advisory NOT listed here fails `pnpm audit:ci`. Example-only findings are separated from the published SDK report: examples are private, unpublished workspaces.",
+  "entries": [
+    {
+      "id": "GHSA-5gmw-xhrv-c9v3",
+      "module": "tinypool",
+      "installed": "1.1.1",
+      "patched": ">=2.1.1",
+      "finding_path": ".>vitest>tinypool",
+      "scope": "root dev tooling (not published)",
+      "reason": "vitest 3.2.x pins tinypool ^1.1.1 and is tightly coupled to its worker-pool API, so tinypool cannot be upgraded independently without breaking vitest.",
+      "remediation": "Upgrade vitest to a release that depends on tinypool 2.x (vitest 5.x) and re-run `pnpm audit:ci`."
+    },
+    {
+      "id": "GHSA-85c8-ppgw-ccpr",
+      "module": "tinypool",
+      "installed": "1.1.1",
+      "patched": ">=2.1.2",
+      "finding_path": ".>vitest>tinypool",
+      "scope": "root dev tooling (not published)",
+      "reason": "vitest 3.2.x pins tinypool ^1.1.1 and is tightly coupled to its worker-pool API, so tinypool cannot be upgraded independently without breaking vitest.",
+      "remediation": "Upgrade vitest to a release that depends on tinypool 2.x (vitest 5.x) and re-run `pnpm audit:ci`."
+    },
+    {
+      "id": "GHSA-p6vx-979v-rg4c",
+      "module": "seroval",
+      "installed": "1.5.6",
+      "patched": ">=1.6.2",
+      "finding_path": "examples__stellar-solid-receive>solid-js>seroval",
+      "scope": "example (private, unpublished)",
+      "reason": "Transitive dependency of solid-js in the stellar-solid-receive example. The example is `private: true` and is not part of the published SDK report.",
+      "remediation": "Upgrade solid-js in examples/stellar-solid-receive so its bundled seroval reaches >=1.6.2."
+    },
+    {
+      "id": "GHSA-pqg4-j6r4-53mv",
+      "module": "shell-quote",
+      "installed": "1.9.0",
+      "patched": ">=1.11.0",
+      "finding_path": "examples__react-native-stellar>react-native>@react-native-community/cli>@react-native-community/cli-tools>shell-quote",
+      "scope": "example (private, unpublished)",
+      "reason": "Deep transitive dependency of react-native/expo in the react-native-stellar example. The example is `private: true` and is not part of the published SDK report.",
+      "remediation": "Upgrade react-native/expo in examples/react-native-stellar so shell-quote reaches >=1.11.0."
+    },
+    {
+      "id": "GHSA-23hp-3jrh-7fpw",
+      "module": "tar",
+      "installed": "6.2.1",
+      "patched": ">=7.5.19",
+      "finding_path": "examples__react-native-stellar>expo>@expo/cli>tar",
+      "scope": "example (private, unpublished)",
+      "reason": "Deep transitive dependency of expo in the react-native-stellar example. The example is `private: true` and is not part of the published SDK report.",
+      "remediation": "Upgrade expo in examples/react-native-stellar so tar reaches >=7.5.19."
+    },
+    {
+      "id": "GHSA-p293-qw3h-jr36",
+      "module": "next",
+      "installed": "14.2.35",
+      "patched": ">=15.5.24",
+      "finding_path": "examples__stellar-nextjs-app-router>next",
+      "scope": "example (private, unpublished)",
+      "reason": "Next.js 14 in the stellar-nextjs-app-router example. The example is `private: true` and is not part of the published SDK report; upgrading Next 14→15 is a major change tracked separately.",
+      "remediation": "Upgrade next in examples/stellar-nextjs-app-router to >=15.5.24."
+    },
+    {
+      "id": "GHSA-2xp9-vwfh-vxw4",
+      "module": "next",
+      "installed": "14.2.35",
+      "patched": ">=15.5.24",
+      "finding_path": "examples__stellar-nextjs-app-router>next",
+      "scope": "example (private, unpublished)",
+      "reason": "Next.js 14 in the stellar-nextjs-app-router example. The example is `private: true` and is not part of the published SDK report; upgrading Next 14→15 is a major change tracked separately.",
+      "remediation": "Upgrade next in examples/stellar-nextjs-app-router to >=15.5.24."
+    }
+  ]
+}
